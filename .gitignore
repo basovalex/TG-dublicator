@@ -1,0 +1,9 @@
+.idea/
+.venv/
+/logs/*
+__pycache__/
+sessions/
+../telegram_channel_duplicator-main1/config.yaml
+session/
+.DS_Store
+.env
