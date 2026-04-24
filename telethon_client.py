@@ -43,7 +43,7 @@ from openai import AsyncOpenAI, APIError
 
 import httpx
 from openai import AsyncOpenAI
-from config import BOT_TOKEN, API_KEY, CHANNELS
+from config import BOT_TOKEN, API_KEY
 
 
 telegram_send_lock = asyncio.Lock()
