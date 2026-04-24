@@ -298,7 +298,8 @@ async def register_handlers(dp: Dispatcher):
                     # 🔥 отправляем временно → получаем file_id
                     sent = await bot.send_photo(
                         chat_id=msg.chat.id,
-                        photo=FSInputFile(output_path)
+                        photo=FSInputFile(output_path),
+                        parse_mode = "HTML"
                     )
 
                     new_file_id = sent.photo[-1].file_id
@@ -327,6 +328,7 @@ async def register_handlers(dp: Dispatcher):
                 # ❗ добавляем caption только к первому
                 if media_group:
                     media_group[0].caption = rows[0][3]
+                    media_group[0].parse_mode = "HTML"
 
                 # 🚀 отправляем новый альбом
                 sent_messages = await bot.send_media_group(
@@ -375,7 +377,8 @@ async def register_handlers(dp: Dispatcher):
             sent = await bot.send_photo(
                 chat_id=msg.chat.id,
                 photo=FSInputFile(output_path),
-                caption=msg.caption
+                caption=msg.caption,
+                parse_mode="HTML"
             )
 
             new_file_id = sent.photo[-1].file_id
@@ -393,7 +396,8 @@ async def register_handlers(dp: Dispatcher):
                 message_id=msg.message_id,
                 media=InputMediaPhoto(
                     media=new_file_id,
-                    caption=msg.caption
+                    caption=msg.caption,
+                    parse_mode = "HTML"
                 ),
                 reply_markup=msg.reply_markup
             )
@@ -507,7 +511,19 @@ async def register_handlers(dp: Dispatcher):
             _, msg_id, file_id, caption, group_message_id, entities, type_message = row
             print(f"[LOG] Обрабатываем msg_id = {msg_id}, type = {type_message}, group_message_id = {group_message_id}")
 
-            text = caption if caption else None
+            if caption:
+
+                if entities:
+
+                    text = entities_to_html_aiogram(caption, entities)
+
+                else:
+
+                    text = caption
+
+            else:
+
+                text = None
 
             # альбом
             if group_message_id is not None:
