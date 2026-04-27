@@ -5,6 +5,7 @@ import asyncio
 from telethon_client import edit_text_with_gpt
 from telethon import TelegramClient
 import json
+from aiogram.enums import ParseMode
 from telethon_client import add_source_chat, get_source_chats, delete_source_chat
 from aiogram.types import CallbackQuery, FSInputFile, MessageEntity, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telethon_client import find_chat
@@ -84,6 +85,24 @@ def escape_html(text: str) -> str:
     if not text:
         return ""
     return html.escape(text)
+
+def is_html_text(text: str) -> bool:
+    if not text:
+        return False
+
+    html_tags = [
+        "<b>", "</b>",
+        "<i>", "</i>",
+        "<u>", "</u>",
+        "<s>", "</s>",
+        "<tg-spoiler>", "</tg-spoiler>",
+        "<code>", "</code>",
+        "<pre>", "</pre>",
+        "<a href="
+    ]
+
+    return any(tag in text for tag in html_tags)
+
 
 def get_text_from_offset(text: str, offset: int, length: int) -> str:
     if not text:
@@ -239,7 +258,7 @@ async def register_handlers(dp: Dispatcher):
                     rows = c.fetchall()
                 # если это одиночное сообщение
                 c.execute(
-                    "UPDATE posts SET caption = ? WHERE msg_id = ?",
+                    "UPDATE posts SET caption = ?, entities = NULL WHERE msg_id = ?",
                     (text_gpt, message_id)
                 )
                 db.commit()
@@ -547,7 +566,6 @@ async def register_handlers(dp: Dispatcher):
     
     @dp.callback_query(F.data == "like")
     async def handle_like(callback: CallbackQuery):
-        MAIN_CHAT_ID = -1003732500567
 
         msg_with_buttons = callback.message
         await msg_with_buttons.delete()
@@ -602,18 +620,15 @@ async def register_handlers(dp: Dispatcher):
             print(f"[LOG] Обрабатываем msg_id = {msg_id}, type = {type_message}, group_message_id = {group_message_id}")
 
             if caption:
-
-                if entities:
-
-                    text = entities_to_html_aiogram(caption, entities)
-
-                else:
-
+                if is_html_text(caption):
                     text = caption
-
+                elif entities:
+                    text = entities_to_html_aiogram(caption, entities)
+                else:
+                    text = caption
             else:
-
                 text = None
+
 
             # альбом
             if group_message_id is not None:
@@ -631,27 +646,38 @@ async def register_handlers(dp: Dispatcher):
                 # одиночное сообщение
                 if type_message == "photo":
                     print(f"[LOG] Отправка одиночного фото msg_id = {msg_id}")
-                    await bot.send_photo(MAIN_CHAT_ID, file_id, caption=text, parse_mode="HTML")
+                    await bot.send_photo(
+                        chat_id=MAIN_CHAT_ID,
+                        photo=file_id,
+                        caption=text,
+                        parse_mode=ParseMode.HTML
+                    )
                 elif type_message == "video":
                     print(f"[LOG] Отправка одиночного видео msg_id = {msg_id}")
-                    await bot.send_video(MAIN_CHAT_ID, file_id, caption=text, parse_mode="HTML")
+                    await bot.send_video(
+                        chat_id=MAIN_CHAT_ID,
+                        video=file_id,
+                        caption=text,
+                        parse_mode=ParseMode.HTML
+                    )
                 elif type_message == "text":
                     print(f"[LOG] Отправка одиночного текста msg_id = {msg_id}")
-                    await bot.send_message(MAIN_CHAT_ID, text, parse_mode="HTML")
-
+                    await bot.send_message(
+                        chat_id=MAIN_CHAT_ID,
+                        text=text,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True
+                    )
             # удаляем из модерации
             try:
                 print(f"[LOG] Удаление сообщения из модерации msg_id = {msg_id}")
                 await bot.delete_message(TARGET_CHAT_ID, msg_id)
             except Exception as e:
                 print(f"[LOG] Ошибка удаления msg_id = {msg_id}: {e}")
-
         # 🔥 отправка альбома
         if media_group:
             media_group[0].caption = first_text
-            media_group[0].parse_mode = "HTML"
-            print(f"[LOG] Отправка альбома с {len(media_group)} медиа")
-
+            media_group[0].parse_mode = ParseMode.HTML
             await bot.send_media_group(
                 chat_id=MAIN_CHAT_ID,
                 media=media_group
