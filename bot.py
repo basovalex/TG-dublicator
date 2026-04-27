@@ -5,6 +5,7 @@ import asyncio
 from telethon_client import edit_text_with_gpt
 from telethon import TelegramClient
 import json
+from telethon_client import add_source_chat, get_source_chats, delete_source_chat
 from aiogram.types import CallbackQuery, FSInputFile, MessageEntity, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telethon_client import find_chat
 from config import MAIN_CHAT_ID
@@ -172,13 +173,25 @@ def entities_to_html_aiogram(text: str, entities_json) -> str:
     return result
 
 async def register_handlers(dp: Dispatcher):
-
     @dp.message(Command("start"))
     async def start_cmd(msg: types.Message):
+
         await msg.answer(
+
             "Команды:\n"
+
             "/parse — начать парсинг\n"
-            "/stop — остановить"
+
+            "/stop — остановить парсинг\n\n"
+
+            "📡 Работа с каналами:\n"
+
+            "/add_channel -1001234567890 — добавить источник\n"
+
+            "/list_channels — список источников\n"
+
+            "/del_channel -1001234567890 — удалить источник"
+
         )
 
     @dp.message(Command("parse"))
@@ -252,7 +265,84 @@ async def register_handlers(dp: Dispatcher):
                         await msg.edit_text(text=text_gpt, parse_mode="HTML", reply_markup=msg.reply_markup)
                 except Exception as e:
                     print("Edit error:", e)
-      
+
+    @dp.message(Command("stop"))
+    async def stop_cmd(msg: types.Message):
+
+        state.enabled = False
+
+        await msg.answer("⛔ Парсинг остановлен")
+
+    @dp.message(Command("add_channel"))
+    async def add_channel_cmd(msg: types.Message):
+
+        parts = msg.text.strip().split()
+
+        if len(parts) != 2:
+            await msg.answer("Использование:\n/add_channel -1001234567890")
+
+            return
+
+        try:
+
+            chat_id = int(parts[1])
+
+        except ValueError:
+
+            await msg.answer("❌ ID канала должен быть числом")
+
+            return
+
+        add_source_chat(chat_id)
+
+        await msg.answer(f"✅ Канал добавлен:\n<code>{chat_id}</code>", parse_mode="HTML")
+
+    @dp.message(Command("list_channels"))
+    async def list_channels_cmd(msg: types.Message):
+
+        channels = get_source_chats()
+
+        if not channels:
+            await msg.answer("📭 Список источников пуст")
+
+            return
+
+        text = "📡 Подключённые источники:\n\n"
+
+        text += "\n".join(f"• <code>{channel}</code>" for channel in channels)
+
+        await msg.answer(text, parse_mode="HTML")
+
+    @dp.message(Command("del_channel"))
+    async def del_channel_cmd(msg: types.Message):
+
+        parts = msg.text.strip().split()
+
+        if len(parts) != 2:
+            await msg.answer("Использование:\n/del_channel -1001234567890")
+
+            return
+
+        try:
+
+            chat_id = int(parts[1])
+
+        except ValueError:
+
+            await msg.answer("❌ ID канала должен быть числом")
+
+            return
+
+        deleted = delete_source_chat(chat_id)
+
+        if deleted:
+
+            await msg.answer(f"🗑 Канал удалён:\n<code>{chat_id}</code>", parse_mode="HTML")
+
+        else:
+
+            await msg.answer("❌ Такого канала нет в базе")
+
     @dp.callback_query(F.data == "reload_image")
     async def reload_image(callback: CallbackQuery):
         await callback.answer("Обрабатываю...")
