@@ -5,6 +5,13 @@ import asyncio
 from telethon_client import edit_text_with_gpt
 from telethon import TelegramClient
 import json
+from telethon_client import (
+    add_source_chat,
+    get_source_chats,
+    get_source_chats_with_titles,
+    delete_source_chat,
+    get_chat_title,
+)
 from aiogram.enums import ParseMode
 from telethon_client import add_source_chat, get_source_chats, delete_source_chat
 from aiogram.types import CallbackQuery, FSInputFile, MessageEntity, InputMediaPhoto, InputMediaVideo, InputMediaDocument
@@ -294,41 +301,41 @@ async def register_handlers(dp: Dispatcher):
 
     @dp.message(Command("add_channel"))
     async def add_channel_cmd(msg: types.Message):
-
         parts = msg.text.strip().split()
-
         if len(parts) != 2:
             await msg.answer("Использование:\n/add_channel -1001234567890")
-
             return
-
         try:
-
             chat_id = int(parts[1])
-
         except ValueError:
-
             await msg.answer("❌ ID канала должен быть числом")
-
             return
-
-        add_source_chat(chat_id)
-
-        await msg.answer(f"✅ Канал добавлен:\n<code>{chat_id}</code>", parse_mode="HTML")
+        title = await get_chat_title(chat_id)
+        add_source_chat(chat_id, title)
+        if title:
+            await msg.answer(
+                f"✅ Канал добавлен:\n<b>{html.escape(title)}</b>\n<code>{chat_id}</code>",
+                parse_mode="HTML"
+            )
+        else:
+            await msg.answer(
+                f"✅ Канал добавлен, но название получить не удалось:\n<code>{chat_id}</code>",
+                parse_mode="HTML"
+            )
 
     @dp.message(Command("list_channels"))
     async def list_channels_cmd(msg: types.Message):
-
-        channels = get_source_chats()
+        channels = get_source_chats_with_titles()
 
         if not channels:
             await msg.answer("📭 Список источников пуст")
-
             return
 
         text = "📡 Подключённые источники:\n\n"
 
-        text += "\n".join(f"• <code>{channel}</code>" for channel in channels)
+        for chat_id, title in channels:
+            title = html.escape(title) if title else "Без названия"
+            text += f"• <b>{title}</b>\n  <code>{chat_id}</code>\n"
 
         await msg.answer(text, parse_mode="HTML")
 
