@@ -43,7 +43,7 @@ from openai import AsyncOpenAI, APIError
 
 import httpx
 from openai import AsyncOpenAI
-from config import BOT_TOKEN, API_KEY
+from config import BOT_TOKEN, API_KEY, CHANNELS
 
 
 telegram_send_lock = asyncio.Lock()
@@ -103,23 +103,32 @@ def get_like_dislike_keyboard():
 def get_source_chats():
     db = sqlite3.connect("posts.db")
     c = db.cursor()
-
     c.execute("SELECT chat_id FROM source_chats")
     rows = c.fetchall()
-
     db.close()
     return [row[0] for row in rows]
 
 
-def add_source_chat(chat_id: int):
+def get_source_chats_with_titles():
     db = sqlite3.connect("posts.db")
     c = db.cursor()
+    c.execute("SELECT chat_id, title FROM source_chats ORDER BY id")
+    rows = c.fetchall()
+    db.close()
+    return rows
 
+
+def add_source_chat(chat_id: int, title: str | None = None):
+    db = sqlite3.connect("posts.db")
+    c = db.cursor()
     c.execute(
-        "INSERT OR IGNORE INTO source_chats (chat_id) VALUES (?)",
-        (chat_id,)
+        """
+        INSERT INTO source_chats (chat_id, title)
+        VALUES (?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title
+        """,
+        (chat_id, title)
     )
-
     db.commit()
     db.close()
 
@@ -135,6 +144,15 @@ def delete_source_chat(chat_id: int):
     db.close()
 
     return deleted_count > 0
+
+async def get_chat_title(chat_id: int) -> str | None:
+    try:
+        entity = await client.get_entity(chat_id)
+        return getattr(entity, "title", None) or getattr(entity, "username", None)
+    except Exception as e:
+        logger.error(f"[{chat_id}] Не удалось получить название: {e}")
+        return None
+
 async def msg_add_database(msg):
     db = sqlite3.connect('posts.db')
 
@@ -698,9 +716,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS source_chats
         (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL UNIQUE
+            chat_id INTEGER NOT NULL UNIQUE,
+            title TEXT
         )
     """)
+
+    c.execute("PRAGMA table_info(source_chats)")
+    columns = [row[1] for row in c.fetchall()]
+    if "title" not in columns:
+        c.execute("ALTER TABLE source_chats ADD COLUMN title TEXT")
 
     db.commit()
     db.close()
