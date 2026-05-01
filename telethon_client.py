@@ -1,6 +1,6 @@
 from aiohttp import ClientSession
 from telethon import TelegramClient
-from config import API_ID, API_HASH, PHONE, CHECK_INTERVAL, TARGET_CHAT_ID, MAIN_CHAT_ID, PROMT
+from config import API_ID, API_HASH, PHONE, CHECK_INTERVAL, TARGET_CHAT_ID, MAIN_CHAT_ID, PROMT, PROMT_MORE_EMOJI, PROMT_REMOVE_EMOJI
 from state import state
 import sqlite3
 import asyncio
@@ -29,6 +29,7 @@ from telethon.tl.types import (
     MessageEntityCashtag,
     MessageEntityEmail,
     DocumentAttributeSticker,
+    DocumentAttributeVideo,
     MessageEntitySpoiler,
     MessageEntityCustomEmoji
 )
@@ -53,10 +54,37 @@ client = TelegramClient("session/user", API_ID, API_HASH)
 
 from aiogram import Bot
 from aiogram import Dispatcher, types
+from aiogram.exceptions import TelegramRetryAfter
 
 
 
 bot = Bot(token=BOT_TOKEN)
+
+def get_retry_after_seconds(error: Exception) -> int | None:
+    if isinstance(error, TelegramRetryAfter):
+        return int(error.retry_after)
+
+    match = re.search(r"(?:retry after|Retry in)\s+(\d+)", str(error), re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+
+    return None
+
+async def bot_api_call(method, *args, **kwargs):
+    async with telegram_send_lock:
+        for attempt in range(1, 6):
+            try:
+                result = await method(*args, **kwargs)
+                await asyncio.sleep(0.35)
+                return result
+            except Exception as e:
+                retry_after = get_retry_after_seconds(e)
+                if retry_after is None or attempt == 5:
+                    raise
+
+                wait_time = retry_after + 1
+                logger.warning(f"Flood control на {method.__name__}: ждём {wait_time} сек.")
+                await asyncio.sleep(wait_time)
 
 async def start_client():
     await client.start(phone=PHONE)
@@ -86,14 +114,38 @@ def escape_markdown(text: str) -> str:
 
 def escape_html(text: str) -> str:
     if not text or text.strip() == "":
-        return "Текста нет"
+        return ""
     return html.escape(text)
+
+def clean_empty_text_markers(text: str | None) -> str:
+    if not text:
+        return ""
+    return re.sub(r"(?:\s*Текста нет\s*)+", "", text).strip()
+
+def get_video_metadata(msg) -> dict:
+    document = getattr(msg, "document", None) or getattr(getattr(msg, "media", None), "document", None)
+    attrs = getattr(document, "attributes", None) or []
+
+    for attr in attrs:
+        if isinstance(attr, DocumentAttributeVideo):
+            metadata = {
+                "duration": int(attr.duration) if attr.duration else None,
+                "width": attr.w,
+                "height": attr.h
+            }
+            return {key: value for key, value in metadata.items() if value}
+
+    return {}
 
 def get_like_dislike_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
     [
         InlineKeyboardButton(text="🔁 Текст", callback_data="reload"),
         InlineKeyboardButton(text="🖼 Фото", callback_data="reload_image")
+    ],
+    [
+        InlineKeyboardButton(text="✨ Эмодзи", callback_data="more_emoji"),
+        InlineKeyboardButton(text="🧹 Без эмодзи", callback_data="remove_emoji")
     ],
     [
         InlineKeyboardButton(text="👍", callback_data="like"),
@@ -144,6 +196,48 @@ def delete_source_chat(chat_id: int):
     db.close()
 
     return deleted_count > 0
+
+def get_last_processed_message_id(chat_id: int) -> int | None:
+    db = sqlite3.connect("posts.db")
+    c = db.cursor()
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_state
+        (
+            chat_id INTEGER PRIMARY KEY,
+            last_message_id INTEGER NOT NULL
+        )
+        """
+    )
+    c.execute("SELECT last_message_id FROM source_state WHERE chat_id = ?", (chat_id,))
+    row = c.fetchone()
+    db.close()
+    return row[0] if row else None
+
+def set_last_processed_message_id(chat_id: int, message_id: int):
+    state.last_message_ids[chat_id] = message_id
+
+    db = sqlite3.connect("posts.db")
+    c = db.cursor()
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS source_state
+        (
+            chat_id INTEGER PRIMARY KEY,
+            last_message_id INTEGER NOT NULL
+        )
+        """
+    )
+    c.execute(
+        """
+        INSERT INTO source_state (chat_id, last_message_id)
+        VALUES (?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET last_message_id = excluded.last_message_id
+        """,
+        (chat_id, message_id)
+    )
+    db.commit()
+    db.close()
 
 async def get_chat_title(chat_id: int) -> str | None:
     try:
@@ -281,9 +375,12 @@ async def send_album(messages):
     caption_not_gpt = None
     caption_gpt = None
 
-    if caption:
+    if caption and caption.strip():
         caption_not_gpt = await entities_to_html(caption, entities, flag=True)
         caption_gpt = await entities_to_html(caption, entities, flag=False)
+    else:
+        caption_not_gpt = None
+        caption_gpt = None
 
     for idx, (file_path, name, msg) in enumerate(temp_files):
         file_input_1 = FSInputFile(file_path, filename=name if msg.document else None)
@@ -295,6 +392,8 @@ async def send_album(messages):
         elif msg.video:
             media_item_not_gpt = InputMediaVideo(media=file_input_1)
             media_item_gpt = InputMediaVideo(media=file_input_2)
+            media_item_not_gpt.supports_streaming = True
+            media_item_gpt.supports_streaming = True
         else:
             media_item_not_gpt = InputMediaDocument(media=file_input_1)
             media_item_gpt = InputMediaDocument(media=file_input_2)
@@ -315,13 +414,15 @@ async def send_album(messages):
         sent_messages_gpt = []
 
         if media_group_not_gpt:
-            sent_messages_not_gpt = await bot.send_media_group(
+            sent_messages_not_gpt = await bot_api_call(
+                bot.send_media_group,
                 chat_id=TARGET_CHAT_ID,
                 media=media_group_not_gpt
             )
 
             first_msg_id = sent_messages_not_gpt[0].message_id
-            await bot.send_message(
+            await bot_api_call(
+                bot.send_message,
                 chat_id=TARGET_CHAT_ID,
                 text="Выберите действие:",
                 reply_markup=get_like_dislike_keyboard(),
@@ -329,18 +430,21 @@ async def send_album(messages):
             )
 
         await asyncio.sleep(2)
-        await bot.send_message(
+        await bot_api_call(
+            bot.send_message,
             chat_id=TARGET_CHAT_ID,
             text="──────────────\n⬆️ *Без нейросети*📝\n⬇️ *С нейросетью*🤖\n──────────────",
             parse_mode="MarkDownV2")
         if media_group_gpt:
-            sent_messages_gpt = await bot.send_media_group(
+            sent_messages_gpt = await bot_api_call(
+                bot.send_media_group,
                 chat_id=TARGET_CHAT_ID,
                 media=media_group_gpt
             )
 
             first_msg_id = sent_messages_gpt[0].message_id
-            await bot.send_message(
+            await bot_api_call(
+                bot.send_message,
                 chat_id=TARGET_CHAT_ID,
                 text="Выберите действие:",
                 reply_markup=get_like_dislike_keyboard(),
@@ -360,7 +464,7 @@ async def send_album(messages):
     
 def escape_md_v2(text: str) -> str:
     if not text or text.strip() == "":
-        return "Текста нет"
+        return ""
     return re.sub(r'([_\*\[\]\(\)~`>#+\-=|{}!.])', r'\\\1', text)
     
 def escape_md_v2_for_markdown(text: str) -> str:
@@ -389,7 +493,7 @@ def get_text_from_offset(text, offset, length):
     return encoded[start_byte:end_byte].decode("utf-16-le")
 
 async def entities_to_html(text: str, entities, flag=False) -> str:
-    if not text:
+    if not text or not text.strip():
         return ""
 
     if not entities:
@@ -438,17 +542,18 @@ async def entities_to_html(text: str, entities, flag=False) -> str:
         result += escape_html(text[last_offset:])
         
     # если после обработки текста нет
-    if not result or result.strip() == "":
-        return "Текста нет"
+    result = clean_empty_text_markers(result)
+    if not result:
+        return ""
     if flag == False:
         gpt_result = await edit_text_with_gpt(result)
 
         if not gpt_result["ok"]:
             return result
 
-        return gpt_result["text"]
+        return clean_empty_text_markers(gpt_result["text"])
     else:
-        return result
+        return clean_empty_text_markers(result)
 
 async def edit_text_with_gpt(result):
     for i in range(1, 5):
@@ -458,11 +563,12 @@ async def edit_text_with_gpt(result):
             response = await client_gpt.chat.completions.create(
                 model="gpt-4.1-mini",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.9,
-                max_tokens=300
+                temperature=0.55,
+                max_tokens=220
             )
             text = response.choices[0].message.content.strip()
             text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+            text = clean_empty_text_markers(text)
             return {
                 "ok": True,
                 "text": text
@@ -475,7 +581,8 @@ async def edit_text_with_gpt(result):
             if i == 1:
                 # 👉 отправляем ошибку отдельным сообщением
                 try:
-                    await bot.send_message(
+                    await bot_api_call(
+                        bot.send_message,
                         chat_id=TARGET_CHAT_ID,
                         text=f"⚠️ Ошибка GPT:\n{error_text}"
                     )
@@ -489,12 +596,97 @@ async def edit_text_with_gpt(result):
         "text": result  # 👉 возвращаем ОРИГИНАЛ
     }
 
+async def add_more_emoji_with_gpt(result):
+    for i in range(1, 5):
+        try:
+            prompt = PROMT_MORE_EMOJI + '\n' + result
+
+            response = await client_gpt.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=350
+            )
+            text = response.choices[0].message.content.strip()
+            text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+            text = clean_empty_text_markers(text)
+            return {
+                "ok": True,
+                "text": text
+            }
+
+        except Exception as e:
+            error_text = str(e)
+            print("Ошибка GPT emoji:", error_text)
+
+            if i == 1:
+                try:
+                    await bot_api_call(
+                        bot.send_message,
+                        chat_id=TARGET_CHAT_ID,
+                        text=f"⚠️ Ошибка GPT emoji:\n{error_text}"
+                    )
+                except:
+                    pass
+
+            await asyncio.sleep(5)
+
+    return {
+        "ok": False,
+        "text": result
+    }
+
+async def remove_emoji_with_gpt(result):
+    for i in range(1, 5):
+        try:
+            prompt = PROMT_REMOVE_EMOJI + '\n' + result
+
+            response = await client_gpt.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.4,
+                max_tokens=350
+            )
+            text = response.choices[0].message.content.strip()
+            text = text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+            text = clean_empty_text_markers(text)
+            return {
+                "ok": True,
+                "text": text
+            }
+
+        except Exception as e:
+            error_text = str(e)
+            print("Ошибка GPT remove emoji:", error_text)
+
+            if i == 1:
+                try:
+                    await bot_api_call(
+                        bot.send_message,
+                        chat_id=TARGET_CHAT_ID,
+                        text=f"⚠️ Ошибка GPT remove emoji:\n{error_text}"
+                    )
+                except:
+                    pass
+
+            await asyncio.sleep(5)
+
+    return {
+        "ok": False,
+        "text": result
+    }
+
 # ===== Универсальная отправка медиа =====
 async def send_media(msg):
     original_text = msg.message or ""
-
-    caption_not_gpt = await entities_to_html(original_text, msg.entities, flag=True)
-    caption = await entities_to_html(original_text, msg.entities, flag=False)
+    if original_text.strip():
+        caption_not_gpt = await entities_to_html(original_text, msg.entities, flag=True)
+        caption = await entities_to_html(original_text, msg.entities, flag=False)
+        caption_not_gpt = clean_empty_text_markers(caption_not_gpt)
+        caption = clean_empty_text_markers(caption)
+    else:
+        caption_not_gpt = None
+        caption = None
     grouped_id = getattr(msg, 'grouped_id', None)
     # Определяем тип медиа
     if msg.photo:
@@ -532,89 +724,99 @@ async def send_media(msg):
         await client.download_media(msg.media, file=file_path)
         # print(msg.media)
         # print(msg.video)
+        send_msg_not_gpt = None
+        send_msg = None
         try:
-            file_input = FSInputFile(file_path, filename=name if msg.document else None)
             if msg.photo:
-                send_msg_not_gpt = await bot.send_photo(
+                send_msg_not_gpt = await bot_api_call(
+                    bot.send_photo,
                     chat_id=TARGET_CHAT_ID,
-                    photo=file_input,
+                    photo=FSInputFile(file_path),
                     caption=caption_not_gpt,
                     parse_mode="HTML",
                     reply_markup=get_like_dislike_keyboard()
                 )
-                await bot.send_message(
+                await bot_api_call(
+                    bot.send_message,
                     chat_id=TARGET_CHAT_ID,
                     text="──────────────\n⬆️ *Без нейросети*📝\n⬇️ *С нейросетью*🤖\n──────────────",
                     parse_mode="MarkDownV2")
-                send_msg = await bot.send_photo(
+                send_msg = await bot_api_call(
+                    bot.send_photo,
                     chat_id=TARGET_CHAT_ID,
-                    photo=file_input,
+                    photo=FSInputFile(file_path),
                     caption=caption,
                     parse_mode="HTML",
                     reply_markup=get_like_dislike_keyboard()
                 )
             elif msg.video:
-
-                media_item = InputMediaVideo(media=FSInputFile(file_path), caption=caption_not_gpt, parse_mode="HTML")
-                send_msgs_not_gpt = await bot.send_media_group(chat_id=TARGET_CHAT_ID, media=[media_item])
-                first_msg_id = send_msgs_not_gpt[0].message_id
-                await bot.send_message(
+                video_metadata = get_video_metadata(msg)
+                send_msg_not_gpt = await bot_api_call(
+                    bot.send_video,
                     chat_id=TARGET_CHAT_ID,
-                    text="Выберите действие:",
+                    video=FSInputFile(file_path),
+                    caption=caption_not_gpt,
+                    parse_mode="HTML",
+                    supports_streaming=True,
                     reply_markup=get_like_dislike_keyboard(),
-                    reply_to_message_id=first_msg_id
+                    **video_metadata
                 )
-                await bot.send_message(
+                await bot_api_call(
+                    bot.send_message,
                     chat_id=TARGET_CHAT_ID,
                     text="──────────────\n⬆️ *Без нейросети*📝\n⬇️ *С нейросетью*🤖\n──────────────",
                     parse_mode="MarkDownV2")
-                send_msg_not_gpt = send_msgs_not_gpt[0]
                 await asyncio.sleep(2)
-                media_item = InputMediaVideo(media=FSInputFile(file_path), caption=caption, parse_mode="HTML")
-                send_msgs = await bot.send_media_group(chat_id=TARGET_CHAT_ID, media=[media_item])
-                first_msg_id = send_msgs[0].message_id
-
-                await bot.send_message(
+                send_msg = await bot_api_call(
+                    bot.send_video,
                     chat_id=TARGET_CHAT_ID,
-                    text="Выберите действие:",
+                    video=FSInputFile(file_path),
+                    caption=caption,
+                    parse_mode="HTML",
+                    supports_streaming=True,
                     reply_markup=get_like_dislike_keyboard(),
-                    reply_to_message_id=first_msg_id
+                    **video_metadata
                 )
-                send_msg = send_msgs[0]
             elif msg.voice:
-                send_msg_not_gpt = await bot.send_voice(
+                send_msg_not_gpt = await bot_api_call(
+                    bot.send_voice,
                     chat_id=TARGET_CHAT_ID,
-                    voice=file_input,
+                    voice=FSInputFile(file_path),
                     caption=caption_not_gpt,
                     parse_mode="HTML",
                     reply_markup=get_like_dislike_keyboard()
                 )
-                await bot.send_message(
+                await bot_api_call(
+                    bot.send_message,
                     chat_id=TARGET_CHAT_ID,
                     text="──────────────\n⬆️ *Без нейросети*📝\n⬇️ *С нейросетью*🤖\n──────────────",
                     parse_mode="MarkDownV2")
-                send_msg = await bot.send_voice(
+                send_msg = await bot_api_call(
+                    bot.send_voice,
                     chat_id=TARGET_CHAT_ID,
-                    voice=file_input,
+                    voice=FSInputFile(file_path),
                     caption=caption,
                     parse_mode="HTML",
                     reply_markup=get_like_dislike_keyboard()
                 )
             elif msg.document:
-                send_msg_not_gpt = await bot.send_document(
+                send_msg_not_gpt = await bot_api_call(
+                    bot.send_document,
                     chat_id=TARGET_CHAT_ID,
-                    document=file_input,
+                    document=FSInputFile(file_path, filename=name if msg.document else None),
                     caption=caption_not_gpt,
                     parse_mode="HTML",
                     reply_markup=get_like_dislike_keyboard()
                 )
-                await bot.send_message(
+                await bot_api_call(
+                    bot.send_message,
                     chat_id=TARGET_CHAT_ID,
                     text="──────────────\n⬆️ *Без нейросети*📝\n⬇️ *С нейросетью*🤖\n──────────────",
                     parse_mode="MarkDownV2")
-                send_msg = await bot.send_document(
+                send_msg = await bot_api_call(
+                    bot.send_document,
                     chat_id=TARGET_CHAT_ID,
-                    document=file_input,
+                    document=FSInputFile(file_path, filename=name if msg.document else None),
                     caption=caption,
                     parse_mode="HTML",
                     reply_markup=get_like_dislike_keyboard()
@@ -625,75 +827,100 @@ async def send_media(msg):
                 os.remove(file_path)
     else:
         # если нет медиа, просто текст
+        send_msg_not_gpt = None
+        send_msg = None
         if original_text:
-            send_msg_not_gpt = await bot.send_message(
+            send_msg_not_gpt = await bot_api_call(
+                bot.send_message,
                 chat_id=TARGET_CHAT_ID,
                 text=caption_not_gpt,
                 parse_mode="HTML",
                 reply_markup=get_like_dislike_keyboard()
             )
-            await bot.send_message(
+            await bot_api_call(
+                bot.send_message,
                 chat_id=TARGET_CHAT_ID,
                 text="──────────────\n⬆️ *Без нейросети*📝\n⬇️ *С нейросетью*🤖\n──────────────",
                 parse_mode="MarkDownV2")
-            send_msg = await bot.send_message(
+            send_msg = await bot_api_call(
+                bot.send_message,
                 chat_id=TARGET_CHAT_ID,
                 text=caption,
                 parse_mode="HTML",
                 reply_markup=get_like_dislike_keyboard()
             )
-    await msg_add_database(send_msg_not_gpt)
-    await msg_add_database(send_msg)
+    if send_msg_not_gpt:
+        await msg_add_database(send_msg_not_gpt)
+    if send_msg:
+        await msg_add_database(send_msg)
+    return bool(send_msg_not_gpt or send_msg)
 
 import logging
 
 logger = logging.getLogger(__name__)
 
 async def process_channel(channel_id):
-    last_id = state.last_message_ids.get(channel_id)
+    last_id = get_last_processed_message_id(channel_id) or state.last_message_ids.get(channel_id)
     logger.info(f"[{channel_id}] Начало обработки канала, last_message_id={last_id}")
 
-    async for msg in client.iter_messages(channel_id, limit=10):
+    new_messages = []
+    async for msg in client.iter_messages(channel_id, limit=100):
         logger.info(f"[{channel_id}] Получено сообщение msg.id={msg.id}, grouped_id={msg.grouped_id}")
 
-        if last_id and msg.id == last_id:
-            logger.info(f"[{channel_id}] Сообщение {msg.id} уже обработано, пропускаем")
+        if last_id and msg.id <= last_id:
             break
 
+        new_messages.append(msg)
+
+        # Первый запуск не должен заливать старую историю целиком.
+        if not last_id:
+            break
+
+    if not new_messages:
+        logger.info(f"[{channel_id}] Новых сообщений нет")
+        return
+
+    new_messages.sort(key=lambda x: x.id)
+    handled_groups = set()
+
+    for msg in new_messages:
         if msg.grouped_id:
-            logger.info(f"[{channel_id}] Это альбом с grouped_id={msg.grouped_id}")
+            if msg.grouped_id in handled_groups:
+                continue
+
+            handled_groups.add(msg.grouped_id)
             album_messages = []
 
-            async for m in client.iter_messages(channel_id, limit=50):
+            async for m in client.iter_messages(channel_id, limit=100):
                 if m.grouped_id == msg.grouped_id:
                     album_messages.append(m)
-                    logger.info(f"[{channel_id}] Добавляем сообщение {m.id} в альбом")
 
             if not album_messages:
                 logger.warning(f"[{channel_id}] Альбом пустой! grouped_id={msg.grouped_id}")
-            else:
-                album_messages.sort(key=lambda x: x.id)
-                logger.info(f"[{channel_id}] Альбом отсортирован, {len(album_messages)} сообщений")
+                continue
 
-                try:
-                    await send_album(album_messages)
-                    logger.info(f"[{channel_id}] Альбом отправлен")
-                except Exception as e:
-                    logger.error(f"[{channel_id}] Ошибка при отправке альбома: {e}")
+            album_messages.sort(key=lambda x: x.id)
+            album_max_id = max(m.id for m in album_messages)
 
-                state.last_message_ids[channel_id] = max(m.id for m in album_messages)
-                break
+            try:
+                await send_album(album_messages)
+                set_last_processed_message_id(channel_id, album_max_id)
+                logger.info(f"[{channel_id}] Альбом {msg.grouped_id} отправлен, last_id={album_max_id}")
+            except Exception as e:
+                logger.error(f"[{channel_id}] Ошибка при отправке альбома {msg.grouped_id}: {e}")
+                return
 
         else:
-            logger.info(f"[{channel_id}] Одиночное сообщение, отправляем")
             try:
-                await send_media(msg)
-                logger.info(f"[{channel_id}] Сообщение {msg.id} отправлено")
+                sent = await send_media(msg)
+                set_last_processed_message_id(channel_id, msg.id)
+                if sent:
+                    logger.info(f"[{channel_id}] Сообщение {msg.id} отправлено, last_id={msg.id}")
+                else:
+                    logger.info(f"[{channel_id}] Сообщение {msg.id} пропущено без медиа/текста, last_id={msg.id}")
             except Exception as e:
                 logger.error(f"[{channel_id}] Ошибка при отправке сообщения {msg.id}: {e}")
-
-            state.last_message_ids[channel_id] = msg.id
-            break
+                return
 
 def init_db():
     db = sqlite3.connect("posts.db")
@@ -718,6 +945,14 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER NOT NULL UNIQUE,
             title TEXT
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS source_state
+        (
+            chat_id INTEGER PRIMARY KEY,
+            last_message_id INTEGER NOT NULL
         )
     """)
 

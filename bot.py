@@ -2,7 +2,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from config import API_ID, API_HASH, PHONE, CHECK_INTERVAL, TARGET_CHAT_ID, API_KEY, PROMPT_IMAGE
 import asyncio
-from telethon_client import edit_text_with_gpt
+from telethon_client import edit_text_with_gpt, add_more_emoji_with_gpt, remove_emoji_with_gpt, clean_empty_text_markers, bot_api_call
 from telethon import TelegramClient
 import json
 from telethon_client import (
@@ -228,69 +228,115 @@ async def register_handlers(dp: Dispatcher):
 
             await msg.answer("✅ Парсинг запущен")
 
-    @dp.callback_query(F.data == "reload")
-    async def handle_like(callback: CallbackQuery): 
-            db = sqlite3.connect('posts.db')
-            await callback.answer("Обновляю текст...")
-            c = db.cursor()   
-            msg = callback.message
-            msg_with_buttons = callback.message
-            message_id = msg.message_id
-            original_msg = msg_with_buttons.reply_to_message
-            msg_id = msg_with_buttons.message_id
-            if original_msg:
-                msg = original_msg
-                msg_id = msg.message_id
-            entities = msg.caption_entities or msg.entities
-            if entities:
-                entities_json = json.dumps([e.model_dump() for e in entities])  
-            else:
-                entities_json = None
-            print("caption", msg.caption)
-            text = entities_to_html_aiogram(msg.caption, entities_json)
-            print("text после html", text)
-            result = await edit_text_with_gpt(text)
-            text_gpt = result["text"] if result["ok"] else text
-            print(text_gpt)
+    async def update_post_text(callback: CallbackQuery, gpt_func, processing_text: str, success_text: str):
+            await callback.answer(processing_text)
 
-            if original_msg:
-                msg = original_msg
-                msg_id = msg_with_buttons.reply_to_message.message_id
-            # Обновляем текст в БД
+            msg_with_buttons = callback.message
+            target_msg = msg_with_buttons.reply_to_message or msg_with_buttons
+            target_msg_id = target_msg.message_id
+
+            db = sqlite3.connect('posts.db')
+            c = db.cursor()
+
             try:
-                c.execute("SELECT * FROM posts WHERE msg_id = ?", (msg_id,))
+                c.execute("SELECT * FROM posts WHERE msg_id = ?", (target_msg_id,))
                 rows = c.fetchall()
-                if rows[0][4] != None:
-                    c.execute("SELECT * FROM posts WHERE group_message_id = ?", (rows[0][4],))
+
+                if not rows:
+                    await callback.answer("Пост не найден")
+                    return
+
+                target_row = rows[0]
+                if target_row[4] is not None:
+                    c.execute(
+                        "SELECT * FROM posts WHERE group_message_id = ?",
+                        (target_row[4],)
+                    )
                     rows = c.fetchall()
-                # если это одиночное сообщение
+
+                db_text = target_row[3]
+                db_entities = target_row[5]
+
+                if db_text:
+                    if is_html_text(db_text):
+                        text = db_text
+                    else:
+                        text = entities_to_html_aiogram(db_text, db_entities)
+                else:
+                    raw_text = target_msg.caption if target_msg.caption is not None else target_msg.text or ""
+                    entities = target_msg.caption_entities or target_msg.entities
+                    entities_json = json.dumps([e.model_dump() for e in entities]) if entities else None
+                    text = entities_to_html_aiogram(raw_text, entities_json)
+
+                text = clean_empty_text_markers(text)
+                if not text.strip():
+                    await callback.answer("У поста нет текста")
+                    return
+
+                result = await gpt_func(text)
+                text_gpt = clean_empty_text_markers(result["text"] if result["ok"] else text)
+
                 c.execute(
                     "UPDATE posts SET caption = ?, entities = NULL WHERE msg_id = ?",
-                    (text_gpt, message_id)
+                    (text_gpt, target_msg_id)
                 )
                 db.commit()
+
             except Exception as e:
-                print("DB update error:", e)
+                print("Text update error:", e)
+                await callback.answer("Ошибка обновления текста")
+                return
             finally:
                 db.close()
-            if rows != []:
-                await callback.answer("Текст отредактирован!")
-                try:
-                    if msg.caption is not None:
-                        await bot.edit_message_caption(chat_id=TARGET_CHAT_ID, message_id=rows[0][1], caption=text_gpt, parse_mode="HTML", reply_markup=msg.reply_markup)
-                    elif msg.text is not None:
-                        await bot.edit_message_text(chat_id=TARGET_CHAT_ID, message_id=rows[0][1], text=text_gpt, parse_mode="HTML", reply_markup=msg.reply_markup)
-                except Exception as e:
-                    print("Edit error:", e)
-            else:
-                await callback.answer("Текст отредактирован!")
-                try:
-                    if msg.caption is not None:
-                        await msg.edit_caption(caption=text_gpt, parse_mode="HTML", reply_markup=msg.reply_markup)
-                    elif msg.text is not None:
-                        await msg.edit_text(text=text_gpt, parse_mode="HTML", reply_markup=msg.reply_markup)
-                except Exception as e:
-                    print("Edit error:", e)
+
+            try:
+                if target_msg.caption is not None:
+                    await bot.edit_message_caption(
+                        chat_id=target_msg.chat.id,
+                        message_id=target_msg_id,
+                        caption=text_gpt,
+                        parse_mode="HTML",
+                        reply_markup=target_msg.reply_markup
+                    )
+                elif target_msg.text is not None:
+                    await bot.edit_message_text(
+                        chat_id=target_msg.chat.id,
+                        message_id=target_msg_id,
+                        text=text_gpt,
+                        parse_mode="HTML",
+                        reply_markup=target_msg.reply_markup
+                    )
+                await callback.answer(success_text)
+            except Exception as e:
+                print("Edit error:", e)
+                await callback.answer("Текст сохранён, но сообщение не отредактировалось")
+
+    @dp.callback_query(F.data == "reload")
+    async def handle_reload(callback: CallbackQuery):
+            await update_post_text(
+                callback,
+                edit_text_with_gpt,
+                "Обновляю текст...",
+                "Текст отредактирован!"
+            )
+
+    @dp.callback_query(F.data == "more_emoji")
+    async def handle_more_emoji(callback: CallbackQuery):
+            await update_post_text(
+                callback,
+                add_more_emoji_with_gpt,
+                "Добавляю эмодзи...",
+                "Эмодзи добавлены!"
+            )
+
+    @dp.callback_query(F.data == "remove_emoji")
+    async def handle_remove_emoji(callback: CallbackQuery):
+            await update_post_text(
+                callback,
+                remove_emoji_with_gpt,
+                "Убираю эмодзи...",
+                "Эмодзи убраны!"
+            )
 
     @dp.message(Command("stop"))
     async def stop_cmd(msg: types.Message):
@@ -412,7 +458,8 @@ async def register_handlers(dp: Dispatcher):
                     output_path = await asyncio.to_thread(regenerate_image, input_path)
 
                     # 🔥 отправляем временно → получаем file_id
-                    sent = await bot.send_photo(
+                    sent = await bot_api_call(
+                        bot.send_photo,
                         chat_id=msg.chat.id,
                         photo=FSInputFile(output_path),
                         parse_mode = "HTML"
@@ -447,13 +494,15 @@ async def register_handlers(dp: Dispatcher):
                     media_group[0].parse_mode = "HTML"
 
                 # 🚀 отправляем новый альбом
-                sent_messages = await bot.send_media_group(
+                sent_messages = await bot_api_call(
+                    bot.send_media_group,
                     chat_id=msg.chat.id,
                     media=media_group
                 )
 
                 # 🔥 создаём кнопки под альбомом
-                buttons_msg = await bot.send_message(
+                buttons_msg = await bot_api_call(
+                    bot.send_message,
                     chat_id=msg.chat.id,
                     text="Выбери действие:",
                     reply_markup=msg.reply_markup,
@@ -490,7 +539,8 @@ async def register_handlers(dp: Dispatcher):
         try:
             output_path = await asyncio.to_thread(regenerate_image, input_path)
 
-            sent = await bot.send_photo(
+            sent = await bot_api_call(
+                bot.send_photo,
                 chat_id=msg.chat.id,
                 photo=FSInputFile(output_path),
                 caption=msg.caption,
@@ -633,6 +683,7 @@ async def register_handlers(dp: Dispatcher):
                     text = entities_to_html_aiogram(caption, entities)
                 else:
                     text = caption
+                text = clean_empty_text_markers(text)
             else:
                 text = None
 
@@ -645,7 +696,7 @@ async def register_handlers(dp: Dispatcher):
                 if type_message == "photo":
                     media_group.append(InputMediaPhoto(media=file_id))
                 elif type_message == "video":
-                    media_group.append(InputMediaVideo(media=file_id))
+                    media_group.append(InputMediaVideo(media=file_id, supports_streaming=True))
                 else:
                     media_group.append(InputMediaDocument(media=file_id))
 
@@ -653,7 +704,8 @@ async def register_handlers(dp: Dispatcher):
                 # одиночное сообщение
                 if type_message == "photo":
                     print(f"[LOG] Отправка одиночного фото msg_id = {msg_id}")
-                    await bot.send_photo(
+                    await bot_api_call(
+                        bot.send_photo,
                         chat_id=MAIN_CHAT_ID,
                         photo=file_id,
                         caption=text,
@@ -661,15 +713,18 @@ async def register_handlers(dp: Dispatcher):
                     )
                 elif type_message == "video":
                     print(f"[LOG] Отправка одиночного видео msg_id = {msg_id}")
-                    await bot.send_video(
+                    await bot_api_call(
+                        bot.send_video,
                         chat_id=MAIN_CHAT_ID,
                         video=file_id,
                         caption=text,
-                        parse_mode=ParseMode.HTML
+                        parse_mode=ParseMode.HTML,
+                        supports_streaming=True
                     )
                 elif type_message == "text":
                     print(f"[LOG] Отправка одиночного текста msg_id = {msg_id}")
-                    await bot.send_message(
+                    await bot_api_call(
+                        bot.send_message,
                         chat_id=MAIN_CHAT_ID,
                         text=text,
                         parse_mode=ParseMode.HTML,
@@ -685,7 +740,8 @@ async def register_handlers(dp: Dispatcher):
         if media_group:
             media_group[0].caption = first_text
             media_group[0].parse_mode = ParseMode.HTML
-            await bot.send_media_group(
+            await bot_api_call(
+                bot.send_media_group,
                 chat_id=MAIN_CHAT_ID,
                 media=media_group
             )
